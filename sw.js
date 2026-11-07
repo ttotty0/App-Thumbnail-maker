@@ -1,10 +1,11 @@
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CACHE = `app-thumbnail-maker-${VERSION}`;
 
 const LOCAL_ASSETS = [
   './',
   './index.html',
   './manifest.json',
+  './app-enhancements.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-maskable-512.png',
@@ -12,7 +13,7 @@ const LOCAL_ASSETS = [
   './icons/favicon-32.png'
 ];
 
-// 외부 CDN 리소스 (오프라인 사용을 위해 미리 저장)
+// External CDN resources (cached for offline use).
 const CDN_ASSETS = [
   'https://cdn.tailwindcss.com',
   'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
@@ -23,12 +24,11 @@ self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
     await cache.addAll(LOCAL_ASSETS);
-    // CDN은 실패해도 설치가 중단되지 않도록 개별 처리
     await Promise.all(CDN_ASSETS.map(async (url) => {
       try {
-        const res = await fetch(url, { mode: 'no-cors' });
-        await cache.put(url, res);
-      } catch (e) { /* 오프라인 설치 시 무시, 이후 런타임에 캐시됨 */ }
+        const response = await fetch(url, { mode: 'no-cors' });
+        await cache.put(url, response);
+      } catch (_) { /* Ignore CDN failures during offline installation. */ }
     }));
     self.skipWaiting();
   })());
@@ -37,41 +37,60 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
     const keys = await caches.keys();
-    await Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)));
+    await Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)));
     await self.clients.claim();
   })());
 });
 
+async function addAppEnhancements(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('text/html')) return response;
+
+  const html = await response.text();
+  if (html.includes('app-enhancements.js')) {
+    return new Response(html, { status: response.status, statusText: response.statusText, headers: response.headers });
+  }
+
+  const updatedHtml = html.replace(/<\/body\s*>/i, '<script src="./app-enhancements.js"></script></body>');
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  return new Response(updatedHtml, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
 self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-  const url = new URL(req.url);
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
   if (!/^https?:$/.test(url.protocol)) return;
 
-  // 페이지 이동: 네트워크 우선, 실패 시 캐시된 index.html
-  if (req.mode === 'navigate') {
+  // Navigation: network first, with cached HTML as the offline fallback.
+  if (request.mode === 'navigate') {
     event.respondWith((async () => {
       try {
-        const fresh = await fetch(req);
+        const fresh = await fetch(request);
         const cache = await caches.open(CACHE);
         cache.put('./index.html', fresh.clone());
-        return fresh;
-      } catch (e) {
-        return (await caches.match(req, { ignoreSearch: true })) ||
-               (await caches.match('./index.html')) ||
-               (await caches.match('./'));
+        return await addAppEnhancements(fresh);
+      } catch (_) {
+        const cached = await caches.match(request, { ignoreSearch: true }) ||
+          await caches.match('./index.html') || await caches.match('./');
+        return cached ? addAppEnhancements(cached) : Response.error();
       }
     })());
     return;
   }
 
-  // 그 외(정적 파일·CDN·폰트): 캐시 우선 + 백그라운드 갱신
+  // Static assets and CDN resources: cache first, then refresh in the background.
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const cached = await cache.match(req);
-    const network = fetch(req).then((res) => {
-      if (res && (res.ok || res.type === 'opaque')) cache.put(req, res.clone());
-      return res;
+    const cached = await cache.match(request);
+    const network = fetch(request).then((response) => {
+      if (response && (response.ok || response.type === 'opaque')) cache.put(request, response.clone());
+      return response;
     }).catch(() => null);
     return cached || (await network) || Response.error();
   })());
